@@ -147,7 +147,7 @@ export default function VerifyOtpScreen() {
   const handleVerify = async () => {
     // Guard against double-submission
     if (verificationInProgress.current) {
-      console.log('⚠️  [OTP Screen] Verification already in progress');
+      console.log('⚠️  [OTP Screen] Verification already in progress, ignoring duplicate call');
       return;
     }
 
@@ -169,20 +169,24 @@ export default function VerifyOtpScreen() {
       return;
     }
 
-    // Set guards
+    // Set guards IMMEDIATELY before any async operations
     verificationInProgress.current = true;
     setIsVerifying(true);
     setError('');
 
+    // Add 500ms cooldown to prevent rapid-fire requests
+    const cooldownTime = 500;
+    const verificationStartTime = Date.now();
+
     try {
       console.log('🔐 [OTP Screen] Verifying OTP...');
-      
+
       const authResult = await gridClientService.completeSignIn(gridUser, cleanOtp);
-      
+
       if (authResult.success && authResult.data) {
         console.log('✅ [OTP Screen] Verification successful!');
         console.log('   Address:', authResult.data.address);
-        
+
         // Clear sessionStorage
         if (Platform.OS === 'web') {
           sessionStorage.removeItem('mallory_grid_user');
@@ -194,11 +198,13 @@ export default function VerifyOtpScreen() {
         router.replace('/(main)');
       } else {
         setError('Verification failed. Please try again.');
+        // Keep guard locked for cooldown period even on error
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, cooldownTime - (Date.now() - verificationStartTime))));
       }
     } catch (err: any) {
       console.error('❌ [OTP Screen] Verification error:', err);
       const errorMessage = err instanceof Error ? err.message : 'Verification failed';
-      
+
       if (errorMessage.toLowerCase().includes('invalid email and code combination')) {
         setError('Invalid code. Please check and try again, or request a new code.');
       } else if (errorMessage.toLowerCase().includes('invalid code')) {
@@ -206,6 +212,9 @@ export default function VerifyOtpScreen() {
       } else {
         setError(errorMessage);
       }
+
+      // Keep guard locked for cooldown period even on error
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, cooldownTime - (Date.now() - verificationStartTime))));
     } finally {
       setIsVerifying(false);
       verificationInProgress.current = false;
@@ -219,15 +228,21 @@ export default function VerifyOtpScreen() {
 
     try {
       console.log('🔄 [OTP Screen] Resending OTP...');
-      
-      const { user: newGridUser } = await gridClientService.startSignIn(params.email);
-      
+
+      // IMPORTANT: Use email from the existing gridUser object (if available),
+      // fallback to params.email. This ensures we always use the correct email
+      // that matches the current Grid session.
+      const emailToUse = gridUser?.email || params.email;
+      console.log('🔄 [OTP Screen] Using email:', emailToUse);
+
+      const { user: newGridUser } = await gridClientService.startSignIn(emailToUse);
+
       // Update both state AND sessionStorage
       setGridUser(newGridUser);
       if (Platform.OS === 'web') {
         sessionStorage.setItem('mallory_grid_user', JSON.stringify(newGridUser));
       }
-      
+
       console.log('✅ [OTP Screen] New OTP sent');
     } catch (err) {
       console.error('❌ [OTP Screen] Failed to resend:', err);

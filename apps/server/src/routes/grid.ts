@@ -135,6 +135,7 @@ router.post('/start-sign-in', authenticateUser, async (req: AuthenticatedRequest
   try {
     const { email } = req.body;
     const userId = req.user!.id;
+    const authEmail = req.user!.email;
 
     if (!email) {
       return res.status(400).json({
@@ -144,6 +145,8 @@ router.post('/start-sign-in', authenticateUser, async (req: AuthenticatedRequest
     }
 
     console.log('🔐 [Grid Init] Starting sign-in (stateless pattern) for user:', userId);
+    console.log('🔐 [Grid Init] Request email:', email);
+    console.log('🔐 [Grid Init] Auth email:', authEmail);
 
     let response;
     let isExistingUser = false;
@@ -306,6 +309,8 @@ router.post('/complete-sign-in', authenticateUser, async (req: AuthenticatedRequ
     }
 
     console.log('🔐 [Grid Verify] Starting OTP verification for user:', userId);
+    console.log('🔐 [Grid Verify] Grid user email:', user.email);
+    console.log('🔐 [Grid Verify] OTP code:', otpCode);
     console.log(`🔐 [Grid Verify] Flow hint: ${isExistingUser ? 'EXISTING USER ✅' : 'NEW USER 🆕'}`);
 
     let authResult: any = { success: false, error: 'Unknown error' };

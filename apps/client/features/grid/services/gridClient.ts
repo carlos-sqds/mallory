@@ -57,8 +57,32 @@ import { GridClient } from '@sqds/grid';
  */
 
 class GridClientService {
+  // Request deduplication - track in-flight requests to prevent duplicates
+  private pendingRequests: Map<string, Promise<any>> = new Map();
+
   constructor() {
     console.log('🔐 Grid client service initialized (backend proxy mode)');
+  }
+
+  /**
+   * Deduplicate requests by key - if same request is in flight, return existing promise
+   */
+  private async deduplicateRequest<T>(key: string, requestFn: () => Promise<T>): Promise<T> {
+    // If request is already in flight, return the existing promise
+    if (this.pendingRequests.has(key)) {
+      console.log(`⚠️  [Grid Client] Deduplicating request: ${key}`);
+      return this.pendingRequests.get(key) as Promise<T>;
+    }
+
+    // Start new request and store promise
+    const promise = requestFn()
+      .finally(() => {
+        // Clean up after request completes
+        this.pendingRequests.delete(key);
+      });
+
+    this.pendingRequests.set(key, promise);
+    return promise;
   }
 
   /**
@@ -99,45 +123,50 @@ class GridClientService {
    * // Show OTP input modal
    */
   async startSignIn(email: string) {
-    try {
-      console.log('🔐 [Grid Client] Starting sign-in for:', email);
+    // Deduplicate requests - use email as key
+    const dedupeKey = `start-sign-in:${email}`;
 
-      // Call backend proxy (backend uses stateless detection)
-      const backendUrl = config.backendApiUrl || 'http://localhost:3001';
-      const token = await secureStorage.getItem('mallory_auth_token');
+    return this.deduplicateRequest(dedupeKey, async () => {
+      try {
+        console.log('🔐 [Grid Client] Starting sign-in for:', email);
 
-      const response = await fetch(`${backendUrl}/api/grid/start-sign-in`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ email })
-      });
+        // Call backend proxy (backend uses stateless detection)
+        const backendUrl = config.backendApiUrl || 'http://localhost:3001';
+        const token = await secureStorage.getItem('mallory_auth_token');
 
-      const data = await response.json();
+        const response = await fetch(`${backendUrl}/api/grid/start-sign-in`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ email })
+        });
 
-      console.log('🔐 [Grid Client] Backend response:', data);
+        const data = await response.json();
 
-      if (!data.success || !data.user) {
-        throw new Error(`Sign-in failed: ${data.error || 'Unknown error'}`);
+        console.log('🔐 [Grid Client] Backend response:', data);
+
+        if (!data.success || !data.user) {
+          throw new Error(`Sign-in failed: ${data.error || 'Unknown error'}`);
+        }
+
+        // Store flow hint for completeSignIn()
+        // This is the KEY to the stateless pattern - passing hint between phases
+        const isExistingUser = data.isExistingUser ?? false;
+        await secureStorage.setItem('mallory_grid_is_existing_user', String(isExistingUser));
+
+        console.log(`✅ [Grid Client] Sign-in started, OTP sent to email (${isExistingUser ? 'existing' : 'new'} user)`);
+
+        return {
+          user: data.user,
+          isExistingUser
+        };
+      } catch (error) {
+        console.error('❌ [Grid Client] Sign-in start error:', error);
+        throw error;
       }
-
-      // Store flow hint for completeSignIn()
-      // This is the KEY to the stateless pattern - passing hint between phases
-      const isExistingUser = data.isExistingUser ?? false;
-      await secureStorage.setItem('mallory_grid_is_existing_user', String(isExistingUser));
-
-      console.log(`✅ [Grid Client] Sign-in started, OTP sent to email (${isExistingUser ? 'existing' : 'new'} user)`);
-
-      return {
-        user: data.user,
-        isExistingUser
-      };
-    } catch (error) {
-      console.error('❌ [Grid Client] Sign-in start error:', error);
-      throw error;
-    }
+    });
   }
 
   /**
@@ -189,74 +218,79 @@ class GridClientService {
    * }
    */
   async completeSignIn(user: any, otpCode: string) {
-    try {
-      console.log('🔐 [Grid Client] Completing sign-in with OTP');
+    // Deduplicate requests - use user email + OTP as key
+    const dedupeKey = `complete-sign-in:${user.email}:${otpCode}`;
 
-      // Retrieve flow hint from storage (set in startSignIn)
-      const isExistingUserStr = await secureStorage.getItem('mallory_grid_is_existing_user');
-      const isExistingUser = isExistingUserStr === 'true';
+    return this.deduplicateRequest(dedupeKey, async () => {
+      try {
+        console.log('🔐 [Grid Client] Completing sign-in with OTP');
 
-      console.log(`🔐 [Grid Client] Flow hint: ${isExistingUser ? 'existing' : 'new'} user`);
+        // Retrieve flow hint from storage (set in startSignIn)
+        const isExistingUserStr = await secureStorage.getItem('mallory_grid_is_existing_user');
+        const isExistingUser = isExistingUserStr === 'true';
 
-      // Generate session secrets on-demand (not stored between start/complete)
-      // These are just cryptographic keys - no need to generate earlier
-      console.log('🔐 [Grid Client] Generating session secrets...');
+        console.log(`🔐 [Grid Client] Flow hint: ${isExistingUser ? 'existing' : 'new'} user`);
 
-      // IMPORTANT: Use same environment as backend (from config)
-      const gridEnv = (config.gridEnv || 'production') as 'sandbox' | 'production';
-      console.log(`🔐 [Grid Client] Using Grid environment: ${gridEnv}`);
+        // Generate session secrets on-demand (not stored between start/complete)
+        // These are just cryptographic keys - no need to generate earlier
+        console.log('🔐 [Grid Client] Generating session secrets...');
 
-      const tempClient = new GridClient({
-        environment: gridEnv,
-        apiKey: 'not-used-for-session-secrets', // GridClient requires apiKey but doesn't use it for generateSessionSecrets
-        baseUrl: 'https://grid.squads.xyz'
-      });
-      const sessionSecrets = await tempClient.generateSessionSecrets();
-      console.log('✅ [Grid Client] Session secrets generated');
+        // IMPORTANT: Use same environment as backend (from config)
+        const gridEnv = (config.gridEnv || 'production') as 'sandbox' | 'production';
+        console.log(`🔐 [Grid Client] Using Grid environment: ${gridEnv}`);
 
-      // Call backend proxy to complete auth (passes flow hint for optimal routing)
-      const backendUrl = config.backendApiUrl || 'http://localhost:3001';
-      const token = await secureStorage.getItem('mallory_auth_token');
+        const tempClient = new GridClient({
+          environment: gridEnv,
+          apiKey: 'not-used-for-session-secrets', // GridClient requires apiKey but doesn't use it for generateSessionSecrets
+          baseUrl: 'https://grid.squads.xyz'
+        });
+        const sessionSecrets = await tempClient.generateSessionSecrets();
+        console.log('✅ [Grid Client] Session secrets generated');
 
-      const response = await fetch(`${backendUrl}/api/grid/complete-sign-in`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          user,
-          otpCode,
-          sessionSecrets,
-          isExistingUser // Flow hint for backend routing
-        })
-      });
+        // Call backend proxy to complete auth (passes flow hint for optimal routing)
+        const backendUrl = config.backendApiUrl || 'http://localhost:3001';
+        const token = await secureStorage.getItem('mallory_auth_token');
 
-      const authResult = await response.json();
+        const response = await fetch(`${backendUrl}/api/grid/complete-sign-in`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            user,
+            otpCode,
+            sessionSecrets,
+            isExistingUser // Flow hint for backend routing
+          })
+        });
 
-      console.log('🔐 [Grid Client] Sign-in completion response:', authResult);
+        const authResult = await response.json();
 
-      if (!authResult.success || !authResult.data) {
-        throw new Error(`Sign-in completion failed: ${authResult.error || 'Unknown error'}`);
+        console.log('🔐 [Grid Client] Sign-in completion response:', authResult);
+
+        if (!authResult.success || !authResult.data) {
+          throw new Error(`Sign-in completion failed: ${authResult.error || 'Unknown error'}`);
+        }
+
+        // Store account data (includes authentication tokens)
+        await secureStorage.setItem('grid_account', JSON.stringify(authResult.data));
+
+        // Store session secrets for future transactions
+        // These never expire - they're permanent "device credentials"
+        await secureStorage.setItem('grid_session_secrets', JSON.stringify(sessionSecrets));
+
+        // Clean up flow hint (no longer needed)
+        await secureStorage.removeItem('mallory_grid_is_existing_user');
+
+        console.log('✅ [Grid Client] Sign-in complete:', authResult.data.address);
+
+        return authResult;
+      } catch (error) {
+        console.error('❌ [Grid Client] Sign-in completion error:', error);
+        throw error;
       }
-
-      // Store account data (includes authentication tokens)
-      await secureStorage.setItem('grid_account', JSON.stringify(authResult.data));
-
-      // Store session secrets for future transactions
-      // These never expire - they're permanent "device credentials"
-      await secureStorage.setItem('grid_session_secrets', JSON.stringify(sessionSecrets));
-
-      // Clean up flow hint (no longer needed)
-      await secureStorage.removeItem('mallory_grid_is_existing_user');
-
-      console.log('✅ [Grid Client] Sign-in complete:', authResult.data.address);
-
-      return authResult;
-    } catch (error) {
-      console.error('❌ [Grid Client] Sign-in completion error:', error);
-      throw error;
-    }
+    });
   }
 
   /**
